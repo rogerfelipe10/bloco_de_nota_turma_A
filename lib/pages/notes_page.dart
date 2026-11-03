@@ -1,4 +1,6 @@
 
+import 'dart:async';
+
 import 'package:bloco_de_nota_turma_a/database/database_helper.dart';
 import 'package:bloco_de_nota_turma_a/models/note.dart';
 import 'package:bloco_de_nota_turma_a/pages/login_page.dart';
@@ -6,6 +8,7 @@ import 'package:bloco_de_nota_turma_a/pages/note_form_page.dart';
 import 'package:bloco_de_nota_turma_a/services/auth_service.dart';
 import 'package:bloco_de_nota_turma_a/services/sync_service.dart';
 import 'package:bloco_de_nota_turma_a/widgets/note_card.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
@@ -19,11 +22,11 @@ class NotesPage extends StatefulWidget {
   const NotesPage({super.key});
 
   @override
-  State<NotesPage> createState() =>
-      _NotesPageState();
+  State<NotesPage> createState() => _NotesPageState();
 }
 
-class _NotesPageState extends State<NotesPage> {
+class _NotesPageState extends State<NotesPage>
+    with WidgetsBindingObserver {
   final DatabaseHelper database =
       DatabaseHelper.instance;
 
@@ -34,6 +37,13 @@ class _NotesPageState extends State<NotesPage> {
   final TextEditingController searchController =
       TextEditingController();
 
+  final Connectivity connectivity = Connectivity();
+
+  StreamSubscription<List<ConnectivityResult>>?
+      connectionSubscription;
+
+  Timer? syncRetryTimer;
+
   List<Note> notes = [];
 
   String selectedCategory = 'Todas';
@@ -41,6 +51,8 @@ class _NotesPageState extends State<NotesPage> {
   bool newestFirst = true;
   bool isLoading = true;
   bool isSyncing = false;
+  bool? previousConnection;
+  bool automaticSyncPaused = false;
 
   final List<String> categories = [
     'Todas',
@@ -54,13 +66,131 @@ class _NotesPageState extends State<NotesPage> {
   void initState() {
     super.initState();
 
+    WidgetsBinding.instance.addObserver(this);
+
     loadNotes();
+    observeConnection();
+    startAutomaticSync();
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        synchronizeNotes();
+        synchronizeNotes(automatic: true);
       }
     });
+  }
+
+  // Detecta se existe conexao com a internet.
+  bool hasConnection(List<ConnectivityResult> results) {
+    return results.any(
+      (result) => result != ConnectivityResult.none,
+    );
+  }
+
+  // Observa as mudancas na conexao.
+  void observeConnection() {
+    connectionSubscription =
+        connectivity.onConnectivityChanged.listen(
+      (results) {
+        updateConnection(results);
+      },
+      onError: (Object error) {
+        debugPrint('Erro ao observar conexao: $error');
+      },
+    );
+
+    checkConnection();
+  }
+
+  // Consulta o estado atual da conexao.
+  Future<void> checkConnection() async {
+    try {
+      final results =
+          await connectivity.checkConnectivity();
+
+      if (!mounted) return;
+
+      updateConnection(results);
+    } catch (e) {
+      debugPrint('Erro ao verificar conexao: $e');
+    }
+  }
+
+  // Detecta quando a internet volta.
+  void updateConnection(
+    List<ConnectivityResult> results,
+  ) {
+    if (!mounted) return;
+
+    final connected = hasConnection(results);
+    final wasConnected = previousConnection;
+
+    previousConnection = connected;
+
+    if (wasConnected == false && connected) {
+      debugPrint('INTERNET RESTAURADA');
+
+      synchronizeNotes(automatic: true);
+    }
+  }
+
+  // Tenta sincronizar notas pendentes a cada 15 segundos.
+  void startAutomaticSync() {
+    syncRetryTimer = Timer.periodic(
+      const Duration(seconds: 15),
+      (timer) async {
+        if (!mounted ||
+            isSyncing ||
+            automaticSyncPaused) {
+          return;
+        }
+
+        final user =
+            FirebaseAuth.instance.currentUser;
+
+        if (user == null) return;
+
+        try {
+          final results =
+              await connectivity.checkConnectivity();
+
+          if (!mounted) return;
+
+          if (!hasConnection(results)) {
+            previousConnection = false;
+            return;
+          }
+
+          final pendingNotes =
+              await database.getPendingNotes(user.uid);
+
+          if (pendingNotes.isEmpty) return;
+
+          if (!mounted || isSyncing) return;
+
+          debugPrint(
+            'SINCRONIZACAO AUTOMATICA: '
+            '${pendingNotes.length} NOTAS PENDENTES',
+          );
+
+          await synchronizeNotes(automatic: true);
+        } catch (e) {
+          debugPrint(
+            'Falha na verificacao automatica: $e',
+          );
+        }
+      },
+    );
+  }
+
+  // Verifica novamente quando o aplicativo volta
+  // para primeiro plano.
+  @override
+  void didChangeAppLifecycleState(
+    AppLifecycleState state,
+  ) {
+    if (state == AppLifecycleState.resumed) {
+      checkConnection();
+    }
   }
 
   // Carrega as notas locais do usuario.
@@ -158,7 +288,6 @@ class _NotesPageState extends State<NotesPage> {
                   ),
                   const SizedBox(height: 16),
 
-                  // Versao local
                   const Text(
                     'VERSÃO DO APLICATIVO',
                     style: TextStyle(
@@ -184,7 +313,6 @@ class _NotesPageState extends State<NotesPage> {
 
                   const SizedBox(height: 16),
 
-                  // Versao Firebase
                   const Text(
                     'VERSÃO DO FIREBASE',
                     style: TextStyle(
@@ -267,21 +395,52 @@ class _NotesPageState extends State<NotesPage> {
     );
   }
 
-  // Sincroniza e permite resolver conflitos.
-  Future<void> synchronizeNotes() async {
-    if (isSyncing) return;
+  // Sincroniza notas manualmente ou automaticamente.
+  Future<void> synchronizeNotes({
+    bool automatic = false,
+  }) async {
+    if (!mounted || isSyncing) return;
+
+    // O usuario pode tentar resolver novamente
+    // um conflito usando o botao manual.
+    if (!automatic) {
+      automaticSyncPaused = false;
+    }
 
     final user = FirebaseAuth.instance.currentUser;
 
     if (user == null) return;
+
+    // Evita tentar acessar o Firebase sem rede.
+    try {
+      final results =
+          await connectivity.checkConnectivity();
+
+      if (!mounted || isSyncing) return;
+
+      if (!hasConnection(results)) {
+        previousConnection = false;
+
+        if (!automatic) {
+          showMessage(
+            'Sem conexão. Suas notas continuam '
+            'salvas no dispositivo.',
+          );
+        }
+
+        return;
+      }
+    } catch (e) {
+      debugPrint('Erro ao verificar conexao: $e');
+    }
+
+    if (!mounted || isSyncing) return;
 
     setState(() {
       isSyncing = true;
     });
 
     try {
-      // Repete a sincronizacao depois de cada
-      // conflito resolvido.
       for (int attempt = 0; attempt < 20; attempt++) {
         try {
           await syncService.syncNotes(user.uid);
@@ -293,9 +452,23 @@ class _NotesPageState extends State<NotesPage> {
           showMessage(
             'Sincronização com Firebase concluída!',
           );
+
           return;
         } on SyncConflict catch (conflict) {
           if (!mounted) return;
+
+          // Durante a sincronizacao automatica,
+          // nao abre repetidamente a janela.
+          if (automatic) {
+            automaticSyncPaused = true;
+
+            showMessage(
+              'Existe um conflito pendente. '
+              'Clique em Sincronizar para resolver.',
+            );
+
+            return;
+          }
 
           await loadNotes();
 
@@ -306,9 +479,12 @@ class _NotesPageState extends State<NotesPage> {
 
           if (choice == null ||
               choice == ConflictChoice.later) {
+            automaticSyncPaused = true;
+
             showMessage(
               'Conflito mantido para resolver depois.',
             );
+
             return;
           }
 
@@ -330,7 +506,6 @@ class _NotesPageState extends State<NotesPage> {
             );
           }
 
-          // Atualiza a lista antes de continuar.
           await loadNotes();
         }
       }
@@ -340,9 +515,18 @@ class _NotesPageState extends State<NotesPage> {
         'Sincronize novamente para continuar.',
       );
     } catch (e) {
-      showMessage(
-        'Não foi possível sincronizar: $e',
-      );
+      debugPrint('Erro na sincronizacao: $e');
+
+      if (automatic) {
+        showMessage(
+          'Não foi possível sincronizar agora. '
+          'Suas notas locais foram preservadas.',
+        );
+      } else {
+        showMessage(
+          'Não foi possível sincronizar: $e',
+        );
+      }
     } finally {
       if (mounted) {
         setState(() {
@@ -470,7 +654,11 @@ class _NotesPageState extends State<NotesPage> {
 
   @override
   void dispose() {
+    syncRetryTimer?.cancel();
+    connectionSubscription?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     searchController.dispose();
+
     super.dispose();
   }
 
@@ -492,7 +680,7 @@ class _NotesPageState extends State<NotesPage> {
             tooltip: 'Sincronizar notas',
             onPressed: isSyncing
                 ? null
-                : synchronizeNotes,
+                : () => synchronizeNotes(),
             icon: isSyncing
                 ? const SizedBox(
                     width: 20,
