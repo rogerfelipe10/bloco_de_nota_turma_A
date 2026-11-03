@@ -4,7 +4,8 @@ import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 
 class DatabaseHelper {
-  static final DatabaseHelper instance = DatabaseHelper._init();
+  static final DatabaseHelper instance =
+      DatabaseHelper._init();
 
   static Database? _database;
 
@@ -26,14 +27,17 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: _createDB,
       onUpgrade: _upgradeDB,
     );
   }
 
-  // Cria o banco completo para novas instalações
-  Future<void> _createDB(Database db, int version) async {
+  // Cria o banco completo em novas instalacoes
+  Future<void> _createDB(
+    Database db,
+    int version,
+  ) async {
     await db.execute('''
       CREATE TABLE notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +48,7 @@ class DatabaseHelper {
         cloudId TEXT,
         category TEXT NOT NULL DEFAULT 'Pessoal',
         updatedAt TEXT NOT NULL,
+        remoteUpdatedAt TEXT,
         syncStatus TEXT NOT NULL DEFAULT 'pending',
         isDeleted INTEGER NOT NULL DEFAULT 0
       )
@@ -55,13 +60,13 @@ class DatabaseHelper {
     ''');
   }
 
-  // Atualiza o banco sem apagar as notas existentes
+  // Atualiza bancos antigos sem apagar notas
   Future<void> _upgradeDB(
     Database db,
     int oldVersion,
     int newVersion,
   ) async {
-    // Atualização da versão 1 para 2
+    // Versao 1 para 2
     if (oldVersion < 2) {
       await db.execute(
         'ALTER TABLE notes ADD COLUMN cloudId TEXT',
@@ -75,12 +80,14 @@ class DatabaseHelper {
         'ALTER TABLE notes ADD COLUMN updatedAt TEXT',
       );
 
-      await db.execute(
-        'UPDATE notes SET updatedAt = date WHERE updatedAt IS NULL',
-      );
+      await db.execute('''
+        UPDATE notes
+        SET updatedAt = date
+        WHERE updatedAt IS NULL
+      ''');
     }
 
-    // Atualização da versão 2 para 3
+    // Versao 2 para 3
     if (oldVersion < 3) {
       await db.execute('''
         ALTER TABLE notes
@@ -95,13 +102,36 @@ class DatabaseHelper {
       ''');
 
       await db.execute('''
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_cloud
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_notes_cloud
         ON notes(uid, cloudId)
       ''');
     }
+
+    // Versao 3 para 4
+    if (oldVersion < 4) {
+      await db.execute('''
+        ALTER TABLE notes
+        ADD COLUMN remoteUpdatedAt TEXT
+      ''');
+
+      // As notas ja sincronizadas conhecem
+      // a versao que foi salva no Firebase.
+      await db.execute('''
+        UPDATE notes
+        SET remoteUpdatedAt = updatedAt
+        WHERE syncStatus = 'synced'
+          AND cloudId IS NOT NULL
+          AND remoteUpdatedAt IS NULL
+      ''');
+
+      // Notas pendentes continuam com
+      // remoteUpdatedAt nulo, caso ainda
+      // nao tenhamos uma versao confiavel.
+    }
   }
 
-  // Salva uma nova nota localmente
+  // Insere uma nova nota local
   Future<int> insertNote(Note note) async {
     final db = await database;
 
@@ -109,13 +139,14 @@ class DatabaseHelper {
       'notes',
       {
         ...note.toMap(),
+        'remoteUpdatedAt': null,
         'syncStatus': 'pending',
         'isDeleted': 0,
       },
     );
   }
 
-  // Busca as notas visíveis do usuário
+  // Busca notas visiveis do usuario
   Future<List<Note>> getNotes(String uid) async {
     final db = await database;
 
@@ -126,27 +157,37 @@ class DatabaseHelper {
       orderBy: 'updatedAt DESC, id DESC',
     );
 
-    return result
-        .map((map) => Note.fromMap(map))
-        .toList();
+    return result.map((map) {
+      return Note.fromMap(map);
+    }).toList();
   }
 
-  // Atualiza uma nota e marca sincronização pendente
+  // Atualiza uma nota local
   Future<int> updateNote(Note note) async {
     final db = await database;
 
+    // Nao altera remoteUpdatedAt.
+    // Ele representa a ultima versao
+    // conhecida da nuvem.
     return await db.update(
       'notes',
       {
         ...note.toMap(),
         'syncStatus': 'pending',
       },
-      where: 'id = ? AND uid = ? AND isDeleted = 0',
-      whereArgs: [note.id, note.uid],
+      where: '''
+        id = ?
+        AND uid = ?
+        AND isDeleted = 0
+      ''',
+      whereArgs: [
+        note.id,
+        note.uid,
+      ],
     );
   }
 
-  // Exclusão lógica: não apaga imediatamente do SQLite
+  // Exclusao logica para permitir uso offline
   Future<int> deleteNote(int id) async {
     final db = await database;
 
@@ -164,7 +205,7 @@ class DatabaseHelper {
     );
   }
 
-  // Recupera alterações pendentes de um usuário
+  // Recupera alteracoes pendentes
   Future<List<Map<String, dynamic>>> getPendingNotes(
     String uid,
   ) async {
@@ -172,14 +213,16 @@ class DatabaseHelper {
 
     return await db.query(
       'notes',
-      where: 'uid = ? AND syncStatus = ?',
+      where: '''
+        uid = ?
+        AND syncStatus = ?
+      ''',
       whereArgs: [uid, 'pending'],
       orderBy: 'id ASC',
     );
   }
 
-  // Marca uma nota como sincronizada
-  // Só confirma se ela não foi alterada durante o envio
+  // Confirma o envio de uma nota ao Firebase
   Future<int> markNoteSynced(
     int id,
     String uid,
@@ -192,6 +235,7 @@ class DatabaseHelper {
       'notes',
       {
         'cloudId': cloudId,
+        'remoteUpdatedAt': expectedUpdatedAt,
         'syncStatus': 'synced',
       },
       where: '''
@@ -208,8 +252,7 @@ class DatabaseHelper {
     );
   }
 
-  // Remove definitivamente uma exclusão
-  // depois da confirmação do Firebase
+  // Confirma exclusao apos o Firebase responder
   Future<int> confirmDeletedNote(
     int id,
     String uid,
@@ -232,14 +275,16 @@ class DatabaseHelper {
       ],
     );
   }
-  
-  // Diagnóstico temporário do SQLite
+
+  // Diagnostico temporario
   Future<List<Map<String, dynamic>>> debugAllNotes() async {
     final db = await database;
+
     return await db.query('notes');
   }
-  
-  // Guarda o ID da nuvem antes de enviar a nota
+
+  // Atribui um identificador da nuvem
+  // sem mudar o estado pendente
   Future<int> assignCloudId(
     int id,
     String uid,
@@ -250,7 +295,9 @@ class DatabaseHelper {
 
     return await db.update(
       'notes',
-      {'cloudId': cloudId},
+      {
+        'cloudId': cloudId,
+      },
       where: '''
         id = ?
         AND uid = ?
@@ -259,11 +306,15 @@ class DatabaseHelper {
         AND syncStatus = 'pending'
         AND isDeleted = 0
       ''',
-      whereArgs: [id, uid, expectedUpdatedAt],
+      whereArgs: [
+        id,
+        uid,
+        expectedUpdatedAt,
+      ],
     );
   }
 
-  // Consulta uma nota local pelo ID do Firestore
+  // Busca uma nota pelo ID da nuvem
   Future<Map<String, dynamic>?> getNoteByCloudId(
     String uid,
     String cloudId,
@@ -272,17 +323,26 @@ class DatabaseHelper {
 
     final result = await db.query(
       'notes',
-      where: 'uid = ? AND cloudId = ?',
-      whereArgs: [uid, cloudId],
+      where: '''
+        uid = ?
+        AND cloudId = ?
+      ''',
+      whereArgs: [
+        uid,
+        cloudId,
+      ],
       limit: 1,
     );
 
-    if (result.isEmpty) return null;
+    if (result.isEmpty) {
+      return null;
+    }
 
     return result.first;
   }
 
-  // Recebe uma nota do Firestore no banco local
+  // Insere ou atualiza uma nota recebida
+  // diretamente do Firebase
   Future<void> saveRemoteNote(Note note) async {
     final db = await database;
 
@@ -295,8 +355,14 @@ class DatabaseHelper {
     await db.transaction((txn) async {
       final existing = await txn.query(
         'notes',
-        where: 'uid = ? AND cloudId = ?',
-        whereArgs: [note.uid, note.cloudId],
+        where: '''
+          uid = ?
+          AND cloudId = ?
+        ''',
+        whereArgs: [
+          note.uid,
+          note.cloudId,
+        ],
         limit: 1,
       );
 
@@ -305,16 +371,18 @@ class DatabaseHelper {
           'notes',
           {
             ...note.toMap(),
+            'remoteUpdatedAt': note.updatedAt,
             'syncStatus': 'synced',
             'isDeleted': 0,
           },
         );
+
         return;
       }
 
       final local = existing.first;
 
-      // Nunca sobrescreve uma alteração local pendente
+      // Protege alteracoes locais pendentes
       if (local['syncStatus'] == 'pending') {
         return;
       }
@@ -327,16 +395,24 @@ class DatabaseHelper {
           'date': note.date,
           'category': note.category,
           'updatedAt': note.updatedAt,
+          'remoteUpdatedAt': note.updatedAt,
           'syncStatus': 'synced',
         },
-        where: 'id = ? AND uid = ? AND isDeleted = 0',
-        whereArgs: [local['id'], note.uid],
+        where: '''
+          id = ?
+          AND uid = ?
+          AND isDeleted = 0
+        ''',
+        whereArgs: [
+          local['id'],
+          note.uid,
+        ],
       );
     });
   }
-  
-  // Remove notas locais que foram excluidas do Firestore.
-  // Preserva todas as alteracoes locais pendentes.
+
+  // Remove notas que ja estavam sincronizadas,
+  // mas foram excluidas da nuvem
   Future<int> removeMissingCloudNotes(
     String uid,
     Set<String> remoteIds,
@@ -346,14 +422,20 @@ class DatabaseHelper {
     return await db.transaction((txn) async {
       final localNotes = await txn.query(
         'notes',
-        columns: ['id', 'cloudId'],
+        columns: [
+          'id',
+          'cloudId',
+        ],
         where: '''
           uid = ?
           AND cloudId IS NOT NULL
           AND syncStatus = ?
           AND isDeleted = 0
         ''',
-        whereArgs: [uid, 'synced'],
+        whereArgs: [
+          uid,
+          'synced',
+        ],
       );
 
       int removed = 0;
@@ -384,5 +466,4 @@ class DatabaseHelper {
       return removed;
     });
   }
-
 }
