@@ -4,7 +4,6 @@ import 'package:firebase_auth/firebase_auth.dart';
 
 import '../models/note.dart';
 
-// Erro específico quando existem alterações concorrentes.
 class NoteConflictException implements Exception {
   final String message;
 
@@ -18,7 +17,8 @@ class FirestoreService {
   final FirebaseFirestore _firestore =
       FirebaseFirestore.instance;
 
-  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final FirebaseAuth _auth =
+      FirebaseAuth.instance;
 
   String _currentUid() {
     final user = _auth.currentUser;
@@ -32,15 +32,12 @@ class FirestoreService {
 
   CollectionReference<Map<String, dynamic>>
       _notesCollection() {
-    final uid = _currentUid();
-
     return _firestore
         .collection('users')
-        .doc(uid)
+        .doc(_currentUid())
         .collection('notes');
   }
 
-  // Converte a nota em dados para o Firestore.
   Map<String, dynamic> _noteData(Note note) {
     if (note.uid != _currentUid()) {
       throw StateError('Usuario nao autorizado');
@@ -56,102 +53,206 @@ class FirestoreService {
     };
   }
 
-  // Metodo atual, mantido temporariamente
-  // para nao quebrar o SyncService existente.
+  // Mantido para compatibilidade.
   Future<String> saveNote(Note note) async {
-    final collection = _notesCollection();
     final data = _noteData(note);
+    final collection = _notesCollection();
 
     final document = note.cloudId == null
         ? collection.doc()
         : collection.doc(note.cloudId!);
 
     await document.set(data);
-
     return document.id;
   }
 
-  // Novo metodo: salva uma nota com verificacao
-  // da versao conhecida pelo dispositivo.
+  // Criacao ou edicao com verificacao de versao.
   Future<String> saveNoteSafely(
     Note note, {
     required bool isNew,
     required String? expectedRemoteUpdatedAt,
   }) async {
     if (note.cloudId == null) {
-      throw ArgumentError(
-        'A nota precisa de cloudId antes do envio',
-      );
+      throw ArgumentError('Nota sem cloudId');
     }
 
     final data = _noteData(note);
-
     final document =
         _notesCollection().doc(note.cloudId!);
 
-    await _firestore.runTransaction((transaction) async {
-      final snapshot = await transaction.get(document);
+    await _firestore.runTransaction(
+      (transaction) async {
+        final snapshot =
+            await transaction.get(document);
 
-      // Nota que ainda nao existe na nuvem.
-      if (isNew) {
-        if (snapshot.exists) {
-          final remote = snapshot.data()!;
+        if (isNew) {
+          if (snapshot.exists) {
+            final remote = snapshot.data()!;
 
-          // Permite repetir um envio ja confirmado
-          // pelo servidor, mas nao pelo SQLite.
-          final sameData =
-              remote['uid'] == note.uid &&
-              remote['title'] == note.title &&
-              remote['content'] == note.content &&
-              remote['date'] == note.date &&
-              remote['category'] == note.category &&
-              remote['updatedAt'] == note.updatedAt;
+            final sameData =
+                remote['uid'] == note.uid &&
+                remote['title'] == note.title &&
+                remote['content'] == note.content &&
+                remote['date'] == note.date &&
+                remote['category'] == note.category &&
+                remote['updatedAt'] == note.updatedAt;
 
-          if (!sameData) {
-            throw NoteConflictException(
-              'A nota ja existe na nuvem '
-              'com dados diferentes.',
-            );
+            if (!sameData) {
+              throw NoteConflictException(
+                'A nota ja existe na nuvem '
+                'com dados diferentes.',
+              );
+            }
+
+            return;
           }
 
+          transaction.set(document, data);
           return;
         }
 
+        if (!snapshot.exists) {
+          throw NoteConflictException(
+            'A nota foi excluida do Firebase.',
+          );
+        }
+
+        final remote = snapshot.data()!;
+
+        if (remote['uid'] != note.uid) {
+          throw StateError('Usuario nao autorizado');
+        }
+
+        if (remote['updatedAt'] !=
+            expectedRemoteUpdatedAt) {
+          throw NoteConflictException(
+            'A nota foi alterada em outro dispositivo.',
+          );
+        }
+
         transaction.set(document, data);
-        return;
-      }
-
-      // Uma atualizacao exige que a nota exista.
-      if (!snapshot.exists) {
-        throw NoteConflictException(
-          'A nota foi excluida da nuvem.',
-        );
-      }
-
-      final remote = snapshot.data()!;
-
-      if (remote['uid'] != note.uid) {
-        throw NoteConflictException(
-          'A nota pertence a outro usuario.',
-        );
-      }
-
-      // Compara a versao conhecida pelo aplicativo
-      // com a versao que existe no Firestore.
-      if (remote['updatedAt'] !=
-          expectedRemoteUpdatedAt) {
-        throw NoteConflictException(
-          'A nota foi alterada em outro dispositivo.',
-        );
-      }
-
-      transaction.set(document, data);
-    });
+      },
+    );
 
     return document.id;
   }
 
-  // Recupera as notas da nuvem.
+  // Exclusao com verificacao de versao.
+  Future<void> deleteNoteSafely(
+    String cloudId, {
+    required String? expectedRemoteUpdatedAt,
+  }) async {
+    final uid = _currentUid();
+    final document =
+        _notesCollection().doc(cloudId);
+
+    await _firestore.runTransaction(
+      (transaction) async {
+        final snapshot =
+            await transaction.get(document);
+
+        if (!snapshot.exists) return;
+
+        final remote = snapshot.data()!;
+
+        if (remote['uid'] != uid) {
+          throw StateError('Usuario nao autorizado');
+        }
+
+        if (remote['updatedAt'] !=
+            expectedRemoteUpdatedAt) {
+          throw NoteConflictException(
+            'A nota foi modificada antes da exclusao.',
+          );
+        }
+
+        transaction.delete(document);
+      },
+    );
+  }
+
+  // Busca um documento diretamente no servidor.
+  Future<Map<String, dynamic>?> getRemoteDocument(
+    String cloudId,
+  ) async {
+    final uid = _currentUid();
+
+    final snapshot =
+        await _notesCollection().doc(cloudId).get(
+      const GetOptions(source: Source.server),
+    );
+
+    if (!snapshot.exists) return null;
+
+    final data = snapshot.data()!;
+
+    if (data['uid'] != uid) {
+      throw StateError('Usuario nao autorizado');
+    }
+
+    return data;
+  }
+
+  // Resolve conflito mantendo a versao do aplicativo.
+  // Confere se a nuvem continua igual ao momento
+  // em que a janela de conflito foi exibida.
+  Future<void> resolveKeepingLocal(
+    Note note, {
+    required Map<String, dynamic> expectedRemote,
+    required bool delete,
+  }) async {
+    if (note.cloudId == null) {
+      throw ArgumentError('Nota sem cloudId');
+    }
+
+    final data = _noteData(note);
+    final document =
+        _notesCollection().doc(note.cloudId!);
+
+    await _firestore.runTransaction(
+      (transaction) async {
+        final snapshot =
+            await transaction.get(document);
+
+        if (!snapshot.exists) {
+          throw NoteConflictException(
+            'A nota foi excluida da nuvem. '
+            'Ela nao sera recriada automaticamente.',
+          );
+        }
+
+        final current = snapshot.data()!;
+
+        if (current['uid'] != note.uid) {
+          throw StateError('Usuario nao autorizado');
+        }
+
+        // Confere o conteudo, nao apenas updatedAt.
+        for (final field in [
+          'uid',
+          'title',
+          'content',
+          'date',
+          'category',
+          'updatedAt',
+        ]) {
+          if (current[field] != expectedRemote[field]) {
+            throw NoteConflictException(
+              'O Firebase mudou novamente. '
+              'Sincronize para revisar o conflito.',
+            );
+          }
+        }
+
+        if (delete) {
+          transaction.delete(document);
+        } else {
+          transaction.set(document, data);
+        }
+      },
+    );
+  }
+
   Future<List<Note>> getNotes() async {
     final uid = _currentUid();
 
@@ -175,43 +276,8 @@ class FirestoreService {
     }).toList();
   }
 
-  // Metodo de exclusao atual.
-  // Mantido ate atualizarmos o SyncService.
+  // Mantido para compatibilidade.
   Future<void> deleteNote(String cloudId) async {
     await _notesCollection().doc(cloudId).delete();
-  }
-
-  // Novo metodo: exclusao com verificacao
-  // da versao armazenada na nuvem.
-  Future<void> deleteNoteSafely(
-    String cloudId, {
-    required String? expectedRemoteUpdatedAt,
-  }) async {
-    final uid = _currentUid();
-    final document = _notesCollection().doc(cloudId);
-
-    await _firestore.runTransaction((transaction) async {
-      final snapshot = await transaction.get(document);
-
-      // Se ja foi excluida, nao ha nada a fazer.
-      if (!snapshot.exists) return;
-
-      final remote = snapshot.data()!;
-
-      if (remote['uid'] != uid) {
-        throw NoteConflictException(
-          'Usuario nao autorizado.',
-        );
-      }
-
-      if (remote['updatedAt'] !=
-          expectedRemoteUpdatedAt) {
-        throw NoteConflictException(
-          'A nota foi modificada antes da exclusao.',
-        );
-      }
-
-      transaction.delete(document);
-    });
   }
 }

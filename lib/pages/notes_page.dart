@@ -9,16 +9,26 @@ import 'package:bloco_de_nota_turma_a/widgets/note_card.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
+enum ConflictChoice {
+  keepLocal,
+  keepFirebase,
+  later,
+}
+
 class NotesPage extends StatefulWidget {
   const NotesPage({super.key});
 
   @override
-  State<NotesPage> createState() => _NotesPageState();
+  State<NotesPage> createState() =>
+      _NotesPageState();
 }
 
 class _NotesPageState extends State<NotesPage> {
-  final DatabaseHelper database = DatabaseHelper.instance;
+  final DatabaseHelper database =
+      DatabaseHelper.instance;
+
   final AuthService authService = AuthService();
+
   final SyncService syncService = SyncService();
 
   final TextEditingController searchController =
@@ -27,6 +37,7 @@ class _NotesPageState extends State<NotesPage> {
   List<Note> notes = [];
 
   String selectedCategory = 'Todas';
+
   bool newestFirst = true;
   bool isLoading = true;
   bool isSyncing = false;
@@ -39,45 +50,22 @@ class _NotesPageState extends State<NotesPage> {
     'Outros',
   ];
 
-  
-@override
-void initState() {
-  super.initState();
+  @override
+  void initState() {
+    super.initState();
 
-  // Mostra primeiro as notas salvas localmente.
-  loadNotes();
+    loadNotes();
 
-  // Tenta sincronizar com o Firebase ao abrir a tela.
-  WidgetsBinding.instance.addPostFrameCallback((_) {
-    if (mounted) {
-      synchronizeNotes();
-    }
-  });
-}
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        synchronizeNotes();
+      }
+    });
+  }
 
-  // Carrega as notas do usuario autenticado
+  // Carrega as notas locais do usuario.
   Future<void> loadNotes() async {
     final user = FirebaseAuth.instance.currentUser;
-
-    // Diagnostico temporario do SQLite
-    try {
-      final allNotes = await database.debugAllNotes();
-
-      debugPrint(
-        'TOTAL DE NOTAS NO SQLITE: ${allNotes.length}',
-      );
-
-      for (final note in allNotes) {
-        debugPrint(
-          'ID: ${note['id']} | '
-          'Titulo: ${note['title']} | '
-          'Excluida: ${note['isDeleted']} | '
-          'Status: ${note['syncStatus']}',
-        );
-      }
-    } catch (e) {
-      debugPrint('Erro no diagnostico SQLite: $e');
-    }
 
     if (user == null) {
       if (mounted) {
@@ -90,14 +78,15 @@ void initState() {
     }
 
     try {
-      final result = await database.getNotes(user.uid);
+      final result =
+          await database.getNotes(user.uid);
 
-      if (mounted) {
-        setState(() {
-          notes = result;
-          isLoading = false;
-        });
-      }
+      if (!mounted) return;
+
+      setState(() {
+        notes = result;
+        isLoading = false;
+      });
     } catch (e) {
       if (!mounted) return;
 
@@ -105,23 +94,270 @@ void initState() {
         isLoading = false;
       });
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Erro ao carregar notas: $e'),
-        ),
-      );
+      showMessage('Erro ao carregar notas: $e');
     }
   }
 
-  // Converte as datas para ordenacao
+  void showMessage(String message) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+      ),
+    );
+  }
+
+  // Exibe a janela com as duas versoes.
+  Future<ConflictChoice?> showConflictDialog(
+    SyncConflict conflict,
+  ) async {
+    if (!mounted) return null;
+
+    final remoteDeleted = conflict.remoteDeleted;
+
+    return showDialog<ConflictChoice>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Row(
+            children: [
+              Icon(
+                Icons.warning_amber_rounded,
+                color: Colors.orange,
+              ),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Conflito de notas',
+                  style: TextStyle(fontSize: 19),
+                ),
+              ),
+            ],
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment:
+                    CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Esta nota foi alterada no '
+                    'aplicativo e no Firebase.',
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    conflict.localTitle,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+
+                  // Versao local
+                  const Text(
+                    'VERSÃO DO APLICATIVO',
+                    style: TextStyle(
+                      color: Color(0xFF6C4AB6),
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF0EAFB),
+                      borderRadius:
+                          BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      conflict.localDeleted
+                          ? 'Nota excluída no aplicativo'
+                          : conflict.localContent,
+                    ),
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  // Versao Firebase
+                  const Text(
+                    'VERSÃO DO FIREBASE',
+                    style: TextStyle(
+                      color: Colors.blue,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFEAF3FC),
+                      borderRadius:
+                          BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      remoteDeleted
+                          ? 'Nota excluída do Firebase'
+                          : conflict.remoteContent ?? '',
+                    ),
+                  ),
+
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Escolha qual versão deseja manter. '
+                    'A outra versão será substituída.',
+                    style: TextStyle(fontSize: 13),
+                  ),
+
+                  if (remoteDeleted) ...[
+                    const SizedBox(height: 10),
+                    const Text(
+                      'A versão local não poderá '
+                      'recriar automaticamente uma '
+                      'nota excluída no Firebase.',
+                      style: TextStyle(
+                        color: Colors.deepOrange,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(
+                  dialogContext,
+                  ConflictChoice.later,
+                );
+              },
+              child: const Text('Resolver depois'),
+            ),
+            OutlinedButton(
+              onPressed: () {
+                Navigator.pop(
+                  dialogContext,
+                  ConflictChoice.keepFirebase,
+                );
+              },
+              child: const Text('Manter Firebase'),
+            ),
+            FilledButton(
+              onPressed: remoteDeleted
+                  ? null
+                  : () {
+                      Navigator.pop(
+                        dialogContext,
+                        ConflictChoice.keepLocal,
+                      );
+                    },
+              child: const Text('Manter aplicativo'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Sincroniza e permite resolver conflitos.
+  Future<void> synchronizeNotes() async {
+    if (isSyncing) return;
+
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) return;
+
+    setState(() {
+      isSyncing = true;
+    });
+
+    try {
+      // Repete a sincronizacao depois de cada
+      // conflito resolvido.
+      for (int attempt = 0; attempt < 20; attempt++) {
+        try {
+          await syncService.syncNotes(user.uid);
+
+          if (!mounted) return;
+
+          await loadNotes();
+
+          showMessage(
+            'Sincronização com Firebase concluída!',
+          );
+          return;
+        } on SyncConflict catch (conflict) {
+          if (!mounted) return;
+
+          await loadNotes();
+
+          final choice =
+              await showConflictDialog(conflict);
+
+          if (!mounted) return;
+
+          if (choice == null ||
+              choice == ConflictChoice.later) {
+            showMessage(
+              'Conflito mantido para resolver depois.',
+            );
+            return;
+          }
+
+          if (choice == ConflictChoice.keepLocal) {
+            await syncService.keepLocalVersion(
+              conflict,
+            );
+
+            showMessage(
+              'Versão do aplicativo mantida.',
+            );
+          } else {
+            await syncService.keepFirebaseVersion(
+              conflict,
+            );
+
+            showMessage(
+              'Versão do Firebase mantida.',
+            );
+          }
+
+          // Atualiza a lista antes de continuar.
+          await loadNotes();
+        }
+      }
+
+      showMessage(
+        'Muitos conflitos encontrados. '
+        'Sincronize novamente para continuar.',
+      );
+    } catch (e) {
+      showMessage(
+        'Não foi possível sincronizar: $e',
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          isSyncing = false;
+        });
+      }
+    }
+  }
+
   DateTime parseNoteDate(Note note) {
     final value = note.updatedAt;
 
     final isoDate = DateTime.tryParse(value);
 
-    if (isoDate != null) {
-      return isoDate;
-    }
+    if (isoDate != null) return isoDate;
 
     try {
       final parts = value.split(' ');
@@ -140,7 +376,7 @@ void initState() {
     }
   }
 
-  // Pesquisa, filtra e ordena
+  // Pesquisa, categoria e ordenacao.
   List<Note> get filteredNotes {
     final search =
         searchController.text.trim().toLowerCase();
@@ -158,9 +394,8 @@ void initState() {
     }).toList();
 
     result.sort((a, b) {
-      final comparison = parseNoteDate(a).compareTo(
-        parseNoteDate(b),
-      );
+      final comparison =
+          parseNoteDate(a).compareTo(parseNoteDate(b));
 
       if (comparison == 0) {
         final idComparison =
@@ -179,78 +414,20 @@ void initState() {
     return result;
   }
 
-  // Envia as notas pendentes ao Firebase
-  Future<void> synchronizeNotes() async {
-    if (isSyncing) return;
-
-    final user = FirebaseAuth.instance.currentUser;
-
-    if (user == null) return;
-
-    setState(() {
-      isSyncing = true;
-    });
-
-    try {
-      await syncService.syncNotes(user.uid);
-
-      if (!mounted) return;
-
-      await loadNotes();
-
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Sincronização com Firebase concluída!',
-          ),
-        ),
-      );
-    } catch (e) {
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            'Não foi possível sincronizar: $e',
-          ),
-        ),
-      );
-    } finally {
-      if (mounted) {
-        setState(() {
-          isSyncing = false;
-        });
-      }
-    }
-  }
-
-  // Exclui uma nota local
   Future<void> deleteNote(int id) async {
     try {
       await database.deleteNote(id);
       await loadNotes();
 
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Nota excluída com sucesso!'),
-        ),
+      showMessage(
+        'Nota excluída localmente. '
+        'Sincronize para atualizar o Firebase.',
       );
     } catch (e) {
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Erro ao excluir nota: $e'),
-        ),
-      );
+      showMessage('Erro ao excluir nota: $e');
     }
   }
 
-  // Faz logout
   Future<void> logout() async {
     await authService.logout();
 
@@ -265,7 +442,6 @@ void initState() {
     );
   }
 
-  // Abre uma nota para edicao
   Future<void> openEditNote(Note note) async {
     await Navigator.push(
       context,
@@ -274,10 +450,11 @@ void initState() {
       ),
     );
 
-    await loadNotes();
+    if (mounted) {
+      await loadNotes();
+    }
   }
 
-  // Abre formulario de nova nota
   Future<void> openNewNote() async {
     await Navigator.push(
       context,
@@ -286,7 +463,9 @@ void initState() {
       ),
     );
 
-    await loadNotes();
+    if (mounted) {
+      await loadNotes();
+    }
   }
 
   @override
@@ -309,7 +488,6 @@ void initState() {
           ),
         ),
         actions: [
-          // Botao de sincronizacao
           IconButton(
             tooltip: 'Sincronizar notas',
             onPressed: isSyncing
@@ -325,20 +503,19 @@ void initState() {
                   )
                 : const Icon(Icons.sync_rounded),
           ),
-
           IconButton(
             tooltip: 'Sair',
-            onPressed: logout,
+            onPressed: isSyncing ? null : logout,
             icon: const Icon(Icons.logout_rounded),
           ),
-
           const SizedBox(width: 8),
         ],
       ),
-
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: openNewNote,
-        backgroundColor: const Color(0xff6c4ab6),
+      floatingActionButton:
+          FloatingActionButton.extended(
+        onPressed: isSyncing ? null : openNewNote,
+        backgroundColor:
+            const Color(0xFF6C4AB6),
         foregroundColor: Colors.white,
         icon: const Icon(Icons.add_rounded),
         label: const Text(
@@ -348,40 +525,41 @@ void initState() {
           ),
         ),
       ),
-
       body: Padding(
         padding: const EdgeInsets.fromLTRB(
           20, 10, 20, 90,
         ),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          crossAxisAlignment:
+              CrossAxisAlignment.start,
           children: [
             Text(
               user?.email ?? '',
               style: const TextStyle(
-                color: Color(0xFF77717f),
+                color: Color(0xFF77717F),
                 fontSize: 13,
               ),
             ),
-
             const SizedBox(height: 20),
 
-            // Campo de pesquisa
+            // Pesquisa
             TextField(
               controller: searchController,
-              onChanged: (value) {
+              onChanged: (_) {
                 setState(() {});
               },
               decoration: InputDecoration(
                 hintText: 'Pesquisar notas...',
                 prefixIcon: const Icon(
                   Icons.search,
-                  color: Color(0xff6c4ab6),
+                  color: Color(0xFF6C4AB6),
                 ),
                 suffixIcon:
                     searchController.text.isNotEmpty
                         ? IconButton(
-                            icon: const Icon(Icons.clear),
+                            icon: const Icon(
+                              Icons.clear,
+                            ),
                             onPressed: () {
                               searchController.clear();
                               setState(() {});
@@ -391,27 +569,28 @@ void initState() {
                 filled: true,
                 fillColor: Colors.white,
                 border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(15),
+                  borderRadius:
+                      BorderRadius.circular(15),
                   borderSide: BorderSide.none,
                 ),
               ),
             ),
-
             const SizedBox(height: 15),
 
-            // Filtro de categoria
+            // Categoria
             DropdownButtonFormField<String>(
               initialValue: selectedCategory,
               decoration: InputDecoration(
                 labelText: 'Filtrar por categoria',
                 prefixIcon: const Icon(
                   Icons.category_rounded,
-                  color: Color(0xff6c4ab6),
+                  color: Color(0xFF6C4AB6),
                 ),
                 filled: true,
                 fillColor: Colors.white,
                 border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(15),
+                  borderRadius:
+                      BorderRadius.circular(15),
                   borderSide: BorderSide.none,
                 ),
               ),
@@ -429,10 +608,9 @@ void initState() {
                 }
               },
             ),
-
             const SizedBox(height: 12),
 
-            // Ordenacao por data
+            // Ordenacao
             Row(
               mainAxisAlignment:
                   MainAxisAlignment.spaceBetween,
@@ -440,7 +618,7 @@ void initState() {
                 Text(
                   '${visibleNotes.length} nota(s)',
                   style: const TextStyle(
-                    color: Color(0xFF77717f),
+                    color: Color(0xFF77717F),
                     fontSize: 13,
                   ),
                 ),
@@ -464,14 +642,14 @@ void initState() {
                 ),
               ],
             ),
-
             const SizedBox(height: 10),
 
-            // Lista de notas
+            // Lista das notas
             Expanded(
               child: isLoading
                   ? const Center(
-                      child: CircularProgressIndicator(),
+                      child:
+                          CircularProgressIndicator(),
                     )
                   : visibleNotes.isEmpty
                       ? Center(
@@ -482,7 +660,8 @@ void initState() {
                               const Icon(
                                 Icons.sticky_note_2_rounded,
                                 size: 65,
-                                color: Color(0xff6c4ab6),
+                                color:
+                                    Color(0xFF6C4AB6),
                               ),
                               const SizedBox(height: 20),
                               Text(
@@ -491,7 +670,8 @@ void initState() {
                                     : 'Nenhuma nota encontrada',
                                 style: const TextStyle(
                                   fontSize: 17,
-                                  fontWeight: FontWeight.bold,
+                                  fontWeight:
+                                      FontWeight.bold,
                                 ),
                               ),
                               const SizedBox(height: 8),
@@ -502,16 +682,26 @@ void initState() {
                           ),
                         )
                       : ListView.builder(
-                          itemCount: visibleNotes.length,
-                          itemBuilder: (context, index) {
-                            final note = visibleNotes[index];
+                          itemCount:
+                              visibleNotes.length,
+                          itemBuilder:
+                              (context, index) {
+                            final note =
+                                visibleNotes[index];
 
                             return NoteCard(
                               note: note,
-                              onTap: () => openEditNote(note),
+                              onTap: () {
+                                if (!isSyncing) {
+                                  openEditNote(note);
+                                }
+                              },
                               onDelete: () {
-                                if (note.id != null) {
-                                  deleteNote(note.id!);
+                                if (!isSyncing &&
+                                    note.id != null) {
+                                  deleteNote(
+                                    note.id!,
+                                  );
                                 }
                               },
                             );

@@ -7,13 +7,51 @@ import '../database/database_helper.dart';
 import '../models/note.dart';
 import 'firestore_service.dart';
 
+// Informacoes usadas pela janela de conflito.
+class SyncConflict implements Exception {
+  final String uid;
+  final Map<String, dynamic> localRow;
+  final Map<String, dynamic>? remoteRow;
+
+  SyncConflict({
+    required this.uid,
+    required this.localRow,
+    required this.remoteRow,
+  });
+
+  int get localId => localRow['id'] as int;
+
+  bool get localDeleted =>
+      localRow['isDeleted'] == 1;
+
+  String get localTitle =>
+      localRow['title'] as String? ?? '';
+
+  String get localContent =>
+      localRow['content'] as String? ?? '';
+
+  String? get remoteTitle =>
+      remoteRow?['title'] as String?;
+
+  String? get remoteContent =>
+      remoteRow?['content'] as String?;
+
+  bool get remoteDeleted => remoteRow == null;
+
+  @override
+  String toString() =>
+      'Conflito na nota $localId';
+}
+
 class SyncService {
-  final DatabaseHelper database = DatabaseHelper.instance;
-  final FirestoreService firestore = FirestoreService();
+  final DatabaseHelper database =
+      DatabaseHelper.instance;
+
+  final FirestoreService firestore =
+      FirestoreService();
 
   bool _isSyncing = false;
 
-  // Verifica se o usuario continua autenticado.
   void checkUser(String uid) {
     final user = FirebaseAuth.instance.currentUser;
 
@@ -24,11 +62,48 @@ class SyncService {
     }
   }
 
-  // Inicia a sincronizacao.
+  Note _noteFromRow(
+    Map<String, dynamic> row,
+    String uid,
+  ) {
+    return Note(
+      id: row['id'] as int,
+      uid: uid,
+      title: row['title'] as String,
+      content: row['content'] as String,
+      date: row['date'] as String,
+      cloudId: row['cloudId'] as String?,
+      category: row['category'] as String? ??
+          'Pessoal',
+      updatedAt: row['updatedAt'] as String,
+    );
+  }
+
+  Future<SyncConflict> _createConflict(
+    String uid,
+    Map<String, dynamic> row,
+    String cloudId,
+  ) async {
+    checkUser(uid);
+
+    final remote =
+        await firestore.getRemoteDocument(cloudId);
+
+    return SyncConflict(
+      uid: uid,
+      localRow: Map<String, dynamic>.from(row),
+      remoteRow: remote == null
+          ? null
+          : Map<String, dynamic>.from(remote),
+    );
+  }
+
+  // Executa a sincronizacao.
   Future<void> syncNotes(String uid) async {
     if (_isSyncing) {
-      debugPrint('SINCRONIZACAO JA EM ANDAMENTO');
-      return;
+      throw StateError(
+        'Ja existe uma sincronizacao em andamento.',
+      );
     }
 
     checkUser(uid);
@@ -41,9 +116,10 @@ class SyncService {
       await downloadCloudNotes(uid);
 
       debugPrint('SINCRONIZACAO FINALIZADA');
+    } on SyncConflict {
+      // Deixa o conflito chegar ate a tela.
+      rethrow;
     } catch (e) {
-      debugPrint('ERRO NA SINCRONIZACAO: $e');
-
       throw Exception(
         'Falha na sincronizacao: $e',
       );
@@ -52,32 +128,28 @@ class SyncService {
     }
   }
 
-  // Envia alteracoes locais ao Firebase.
   Future<void> uploadPendingNotes(String uid) async {
     checkUser(uid);
 
     final pendingNotes =
         await database.getPendingNotes(uid);
 
-    debugPrint(
-      'NOTAS PENDENTES: ${pendingNotes.length}',
-    );
-
     for (final row in pendingNotes) {
       checkUser(uid);
 
       final id = row['id'] as int;
-      final isDeleted = row['isDeleted'] == 1;
-      final updatedAt = row['updatedAt'] as String;
+      final updatedAt =
+          row['updatedAt'] as String;
 
-      String? cloudId = row['cloudId'] as String?;
+      String? cloudId =
+          row['cloudId'] as String?;
 
       final remoteUpdatedAt =
           row['remoteUpdatedAt'] as String?;
 
-      // --------------------------------
-      // EXCLUSOES PENDENTES
-      // --------------------------------
+      final isDeleted = row['isDeleted'] == 1;
+
+      // Nota excluida localmente.
       if (isDeleted) {
         if (cloudId == null) {
           await database.confirmDeletedNote(
@@ -88,19 +160,44 @@ class SyncService {
           continue;
         }
 
+        // Sem versao conhecida, exige decisao
+        // caso haja documento na nuvem.
         if (remoteUpdatedAt == null) {
-          throw NoteConflictException(
-            'Nao foi possivel verificar a versao '
-            'da nota excluida $id. '
-            'A exclusao foi preservada localmente.',
+          final remote =
+              await firestore.getRemoteDocument(
+            cloudId,
           );
+
+          if (remote == null) {
+            await database.confirmDeletedNote(
+              id,
+              uid,
+              updatedAt,
+            );
+          } else {
+            throw SyncConflict(
+              uid: uid,
+              localRow: row,
+              remoteRow: remote,
+            );
+          }
+
+          continue;
         }
 
-        await firestore.deleteNoteSafely(
-          cloudId,
-          expectedRemoteUpdatedAt:
-              remoteUpdatedAt,
-        );
+        try {
+          await firestore.deleteNoteSafely(
+            cloudId,
+            expectedRemoteUpdatedAt:
+                remoteUpdatedAt,
+          );
+        } on NoteConflictException {
+          throw await _createConflict(
+            uid,
+            row,
+            cloudId,
+          );
+        }
 
         checkUser(uid);
 
@@ -110,33 +207,13 @@ class SyncService {
           updatedAt,
         );
 
-        debugPrint(
-          'EXCLUSAO SINCRONIZADA: $id',
-        );
-
         continue;
       }
 
-      // --------------------------------
-      // CRIACAO E EDICAO DE NOTAS
-      // --------------------------------
-
-      // Uma nota nova pode ja ter recebido
-      // cloudId durante uma tentativa offline.
-      // Portanto, somente cloudId nao indica
-      // que a primeira sincronizacao terminou.
+      // Nota criada ou editada localmente.
       final isNew = remoteUpdatedAt == null;
 
-      // Se ainda nao existe identificador,
-      // cria um identificador permanente.
       if (cloudId == null) {
-        if (!isNew) {
-          throw StateError(
-            'Nota $id possui versao remota, '
-            'mas nao possui cloudId.',
-          );
-        }
-
         cloudId = FirebaseFirestore.instance
             .collection('users')
             .doc(uid)
@@ -152,72 +229,201 @@ class SyncService {
           updatedAt,
         );
 
-        if (assigned == 0) {
-          debugPrint(
-            'NOTA ALTERADA DURANTE O ENVIO: $id',
-          );
-          continue;
-        }
+        if (assigned == 0) continue;
       }
 
-      final note = Note(
-        id: id,
-        uid: uid,
-        title: row['title'] as String,
-        content: row['content'] as String,
-        date: row['date'] as String,
-        cloudId: cloudId,
-        category: row['category'] as String,
-        updatedAt: updatedAt,
+      final note = _noteFromRow(
+        {
+          ...row,
+          'cloudId': cloudId,
+        },
+        uid,
       );
 
-      // A transacao verifica a nuvem.
-      //
-      // Se a nota ainda nao existe:
-      // permite criar uma nota nova.
-      //
-      // Se ja existe com dados identicos:
-      // permite confirmar envio anterior.
-      //
-      // Se existe com dados diferentes:
-      // bloqueia o envio e preserva o SQLite.
-      //
-      // Para notas com versao conhecida,
-      // exige que a versao remota seja igual.
-      await firestore.saveNoteSafely(
-        note,
-        isNew: isNew,
-        expectedRemoteUpdatedAt:
-            remoteUpdatedAt,
-      );
+      try {
+        await firestore.saveNoteSafely(
+          note,
+          isNew: isNew,
+          expectedRemoteUpdatedAt:
+              remoteUpdatedAt,
+        );
+      } on NoteConflictException {
+        throw await _createConflict(
+          uid,
+          row,
+          cloudId,
+        );
+      }
 
       checkUser(uid);
 
-      final confirmed =
-          await database.markNoteSynced(
+      await database.markNoteSynced(
         id,
         uid,
         cloudId,
         updatedAt,
       );
-
-      if (confirmed == 1) {
-        debugPrint(
-          'NOTA SINCRONIZADA: $id',
-        );
-      } else {
-        debugPrint(
-          'NOTA ALTERADA DURANTE O ENVIO: $id',
-        );
-      }
     }
   }
 
-  // Baixa notas da nuvem para o SQLite.
-  Future<void> downloadCloudNotes(String uid) async {
+  // Opcao escolhida na janela:
+  // manter a versao do aplicativo.
+  Future<void> keepLocalVersion(
+    SyncConflict conflict,
+  ) async {
+    checkUser(conflict.uid);
+
+    if (conflict.remoteDeleted) {
+      throw NoteConflictException(
+        'A nota foi excluida do Firebase. '
+        'Nao sera recriada automaticamente.',
+      );
+    }
+
+    final row = conflict.localRow;
+    final uid = conflict.uid;
+    final id = conflict.localId;
+    final updatedAt =
+        row['updatedAt'] as String;
+
+    final cloudId = row['cloudId'] as String?;
+
+    if (cloudId == null) {
+      throw StateError(
+        'Nota sem identificador da nuvem.',
+      );
+    }
+
+    final current =
+        await database.getNoteByCloudId(
+      uid,
+      cloudId,
+    );
+
+    if (current == null ||
+        current['id'] != id ||
+        current['syncStatus'] != 'pending' ||
+        current['updatedAt'] != updatedAt ||
+        current['isDeleted'] != row['isDeleted']) {
+      throw StateError(
+        'A nota local mudou. Sincronize novamente.',
+      );
+    }
+
+    await firestore.resolveKeepingLocal(
+      _noteFromRow(row, uid),
+      expectedRemote: conflict.remoteRow!,
+      delete: conflict.localDeleted,
+    );
+
     checkUser(uid);
 
-    debugPrint('BUSCANDO NOTAS NO FIRESTORE');
+    if (conflict.localDeleted) {
+      await database.confirmDeletedNote(
+        id,
+        uid,
+        updatedAt,
+      );
+    } else {
+      await database.markNoteSynced(
+        id,
+        uid,
+        cloudId,
+        updatedAt,
+      );
+    }
+  }
+
+  // Opcao escolhida na janela:
+  // manter a versao do Firebase.
+  Future<void> keepFirebaseVersion(
+    SyncConflict conflict,
+  ) async {
+    final uid = conflict.uid;
+
+    checkUser(uid);
+
+    final cloudId =
+        conflict.localRow['cloudId'] as String?;
+
+    if (cloudId == null) {
+      throw StateError('Nota sem cloudId.');
+    }
+
+    // Busca a versao mais recente da nuvem.
+    final remote =
+        await firestore.getRemoteDocument(cloudId);
+
+    checkUser(uid);
+
+    
+    final db = await database.database;
+
+    await db.transaction((txn) async {
+
+      final rows = await txn.query(
+        'notes',
+        where: '''
+          id = ?
+          AND uid = ?
+          AND cloudId = ?
+          AND syncStatus = 'pending'
+          AND updatedAt = ?
+          AND isDeleted = ?
+        ''',
+        whereArgs: [
+          conflict.localId,
+          uid,
+          cloudId,
+          conflict.localRow['updatedAt'],
+          conflict.localRow['isDeleted'],
+        ],
+        limit: 1,
+      );
+
+      if (rows.isEmpty) {
+        throw StateError(
+          'A nota local mudou. Sincronize novamente.',
+        );
+      }
+
+      if (remote == null) {
+        // O Firebase nao possui mais essa nota.
+        await txn.delete(
+          'notes',
+          where: 'id = ? AND uid = ?',
+          whereArgs: [conflict.localId, uid],
+        );
+
+        return;
+      }
+
+      await txn.update(
+        'notes',
+        {
+          'title': remote['title'] as String? ?? '',
+          'content':
+              remote['content'] as String? ?? '',
+          'date': remote['date'] as String? ?? '',
+          'category':
+              remote['category'] as String? ??
+                  'Pessoal',
+          'updatedAt':
+              remote['updatedAt'] as String? ?? '',
+          'remoteUpdatedAt':
+              remote['updatedAt'] as String? ?? '',
+          'syncStatus': 'synced',
+          'isDeleted': 0,
+        },
+        where: 'id = ? AND uid = ?',
+        whereArgs: [conflict.localId, uid],
+      );
+    });
+  }
+
+  // Baixa as notas do Firebase.
+  Future<void> downloadCloudNotes(String uid) async {
+    checkUser(uid);
 
     final snapshot = await FirebaseFirestore.instance
         .collection('users')
@@ -245,22 +451,20 @@ class SyncService {
 
       final data = doc.data();
 
-      if (data['uid'] != uid) {
-        debugPrint(
-          'DOCUMENTO IGNORADO POR UID DIFERENTE',
-        );
-        continue;
-      }
+      if (data['uid'] != uid) continue;
 
       final note = Note(
         cloudId: doc.id,
         uid: uid,
         title: data['title'] as String? ?? '',
-        content: data['content'] as String? ?? '',
+        content:
+            data['content'] as String? ?? '',
         date: data['date'] as String? ?? '',
         category:
-            data['category'] as String? ?? 'Pessoal',
-        updatedAt: data['updatedAt'] as String?,
+            data['category'] as String? ??
+                'Pessoal',
+        updatedAt:
+            data['updatedAt'] as String?,
       );
 
       await database.saveRemoteNote(note);
