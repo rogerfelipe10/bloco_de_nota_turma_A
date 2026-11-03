@@ -19,20 +19,20 @@ class DatabaseHelper {
     return _database!;
   }
 
-  // Inicializa o banco de dados
+  // Inicializa o SQLite
   Future<Database> _initDB(String fileName) async {
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, fileName);
 
     return await openDatabase(
       path,
-      version: 2,
+      version: 3,
       onCreate: _createDB,
       onUpgrade: _upgradeDB,
     );
   }
 
-  // Cria a tabela com os novos campos
+  // Cria o banco completo para novas instalações
   Future<void> _createDB(Database db, int version) async {
     await db.execute('''
       CREATE TABLE notes (
@@ -43,17 +43,25 @@ class DatabaseHelper {
         date TEXT NOT NULL,
         cloudId TEXT,
         category TEXT NOT NULL DEFAULT 'Pessoal',
-        updatedAt TEXT NOT NULL
+        updatedAt TEXT NOT NULL,
+        syncStatus TEXT NOT NULL DEFAULT 'pending',
+        isDeleted INTEGER NOT NULL DEFAULT 0
       )
+    ''');
+
+    await db.execute('''
+      CREATE UNIQUE INDEX idx_notes_cloud
+      ON notes(uid, cloudId)
     ''');
   }
 
-  // Atualiza bancos antigos sem apagar as notas
+  // Atualiza o banco sem apagar as notas existentes
   Future<void> _upgradeDB(
     Database db,
     int oldVersion,
     int newVersion,
   ) async {
+    // Atualização da versão 1 para 2
     if (oldVersion < 2) {
       await db.execute(
         'ALTER TABLE notes ADD COLUMN cloudId TEXT',
@@ -71,52 +79,164 @@ class DatabaseHelper {
         'UPDATE notes SET updatedAt = date WHERE updatedAt IS NULL',
       );
     }
+
+    // Atualização da versão 2 para 3
+    if (oldVersion < 3) {
+      await db.execute('''
+        ALTER TABLE notes
+        ADD COLUMN syncStatus TEXT NOT NULL
+        DEFAULT 'pending'
+      ''');
+
+      await db.execute('''
+        ALTER TABLE notes
+        ADD COLUMN isDeleted INTEGER NOT NULL
+        DEFAULT 0
+      ''');
+
+      await db.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_cloud
+        ON notes(uid, cloudId)
+      ''');
+    }
   }
 
-  // Cadastra uma nota no SQLite
+  // Salva uma nova nota localmente
   Future<int> insertNote(Note note) async {
     final db = await database;
 
     return await db.insert(
       'notes',
-      note.toMap(),
+      {
+        ...note.toMap(),
+        'syncStatus': 'pending',
+        'isDeleted': 0,
+      },
     );
   }
 
-  // Consulta as notas do usuário
+  // Busca as notas visíveis do usuário
   Future<List<Note>> getNotes(String uid) async {
     final db = await database;
 
     final result = await db.query(
       'notes',
-      where: 'uid = ?',
+      where: 'uid = ? AND isDeleted = 0',
       whereArgs: [uid],
       orderBy: 'updatedAt DESC, id DESC',
     );
 
-    return result.map((map) => Note.fromMap(map)).toList();
+    return result
+        .map((map) => Note.fromMap(map))
+        .toList();
   }
 
-  // Atualiza uma nota existente
+  // Atualiza uma nota e marca sincronização pendente
   Future<int> updateNote(Note note) async {
     final db = await database;
 
     return await db.update(
       'notes',
-      note.toMap(),
-      where: 'id = ? AND uid = ?',
+      {
+        ...note.toMap(),
+        'syncStatus': 'pending',
+      },
+      where: 'id = ? AND uid = ? AND isDeleted = 0',
       whereArgs: [note.id, note.uid],
     );
   }
 
-  // Exclui uma nota
+  // Exclusão lógica: não apaga imediatamente do SQLite
   Future<int> deleteNote(int id) async {
+    final db = await database;
+
+    return await db.update(
+      'notes',
+      {
+        'isDeleted': 1,
+        'syncStatus': 'pending',
+        'updatedAt': DateTime.now()
+            .toUtc()
+            .toIso8601String(),
+      },
+      where: 'id = ? AND isDeleted = 0',
+      whereArgs: [id],
+    );
+  }
+
+  // Recupera alterações pendentes de um usuário
+  Future<List<Map<String, dynamic>>> getPendingNotes(
+    String uid,
+  ) async {
+    final db = await database;
+
+    return await db.query(
+      'notes',
+      where: 'uid = ? AND syncStatus = ?',
+      whereArgs: [uid, 'pending'],
+      orderBy: 'id ASC',
+    );
+  }
+
+  // Marca uma nota como sincronizada
+  // Só confirma se ela não foi alterada durante o envio
+  Future<int> markNoteSynced(
+    int id,
+    String uid,
+    String cloudId,
+    String expectedUpdatedAt,
+  ) async {
+    final db = await database;
+
+    return await db.update(
+      'notes',
+      {
+        'cloudId': cloudId,
+        'syncStatus': 'synced',
+      },
+      where: '''
+        id = ?
+        AND uid = ?
+        AND updatedAt = ?
+        AND isDeleted = 0
+      ''',
+      whereArgs: [
+        id,
+        uid,
+        expectedUpdatedAt,
+      ],
+    );
+  }
+
+  // Remove definitivamente uma exclusão
+  // depois da confirmação do Firebase
+  Future<int> confirmDeletedNote(
+    int id,
+    String uid,
+    String expectedUpdatedAt,
+  ) async {
     final db = await database;
 
     return await db.delete(
       'notes',
-      where: 'id = ?',
-      whereArgs: [id],
+      where: '''
+        id = ?
+        AND uid = ?
+        AND isDeleted = 1
+        AND updatedAt = ?
+      ''',
+      whereArgs: [
+        id,
+        uid,
+        expectedUpdatedAt,
+      ],
     );
   }
+  
+  // Diagnóstico temporário do SQLite
+  Future<List<Map<String, dynamic>>> debugAllNotes() async {
+    final db = await database;
+    return await db.query('notes');
+  }
+
 }

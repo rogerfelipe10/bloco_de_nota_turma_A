@@ -42,9 +42,38 @@ class _NotesPageState extends State<NotesPage> {
     loadNotes();
   }
 
-  // Carrega as notas do SQLite
+  // Carrega as notas do usuario autenticado
   Future<void> loadNotes() async {
     final user = FirebaseAuth.instance.currentUser;
+
+    // DIAGNOSTICO TEMPORARIO DO SQLITE
+    try {
+      final allNotes = await database.debugAllNotes();
+
+      debugPrint(
+        'TOTAL DE NOTAS NO SQLITE: ${allNotes.length}',
+      );
+
+      for (final note in allNotes) {
+        debugPrint(
+          'ID: ${note['id']} | '
+          'UID: ${note['uid']} | '
+          'Titulo: ${note['title']} | '
+          'Excluida: ${note['isDeleted']}',
+        );
+      }
+
+      if (user != null) {
+        debugPrint(
+          'UID DO USUARIO ATUAL: ${user.uid}',
+        );
+      }
+    } catch (e) {
+      debugPrint(
+        'ERRO AO CONSULTAR SQLITE: $e',
+      );
+    }
+    // FIM DO DIAGNOSTICO
 
     if (user == null) {
       if (mounted) {
@@ -80,7 +109,7 @@ class _NotesPageState extends State<NotesPage> {
     }
   }
 
-  // Converte datas antigas e novas para ordenação
+  // Converte datas antigas e novas
   DateTime parseNoteDate(Note note) {
     final value = note.updatedAt;
 
@@ -109,9 +138,8 @@ class _NotesPageState extends State<NotesPage> {
 
   // Pesquisa, filtra e ordena as notas
   List<Note> get filteredNotes {
-    final search = searchController.text
-        .trim()
-        .toLowerCase();
+    final search =
+        searchController.text.trim().toLowerCase();
 
     final result = notes.where((note) {
       final matchesSearch =
@@ -148,7 +176,7 @@ class _NotesPageState extends State<NotesPage> {
     return result;
   }
 
-  // Exclui uma nota local
+  // Exclui uma nota localmente
   Future<void> deleteNote(int id) async {
     try {
       await database.deleteNote(id);
@@ -158,7 +186,7 @@ class _NotesPageState extends State<NotesPage> {
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Nota excluída com sucesso!'),
+          content: Text('Nota excluida com sucesso!'),
         ),
       );
     } catch (e) {
@@ -187,7 +215,7 @@ class _NotesPageState extends State<NotesPage> {
     );
   }
 
-  // Editar nota
+  // Abre uma nota para edicao
   Future<void> openEditNote(Note note) async {
     await Navigator.push(
       context,
@@ -199,7 +227,7 @@ class _NotesPageState extends State<NotesPage> {
     await loadNotes();
   }
 
-  // Criar nova nota
+  // Abre o formulario de nova nota
   Future<void> openNewNote() async {
     await Navigator.push(
       context,
@@ -260,7 +288,6 @@ class _NotesPageState extends State<NotesPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // E-mail do usuário
             Text(
               user?.email ?? '',
               style: const TextStyle(
@@ -271,7 +298,7 @@ class _NotesPageState extends State<NotesPage> {
 
             const SizedBox(height: 20),
 
-            // Campo de pesquisa
+            // Pesquisa
             TextField(
               controller: searchController,
               onChanged: (value) {
@@ -283,15 +310,16 @@ class _NotesPageState extends State<NotesPage> {
                   Icons.search,
                   color: Color(0xff6c4ab6),
                 ),
-                suffixIcon: searchController.text.isNotEmpty
-                    ? IconButton(
-                        icon: const Icon(Icons.clear),
-                        onPressed: () {
-                          searchController.clear();
-                          setState(() {});
-                        },
-                      )
-                    : null,
+                suffixIcon:
+                    searchController.text.isNotEmpty
+                        ? IconButton(
+                            icon: const Icon(Icons.clear),
+                            onPressed: () {
+                              searchController.clear();
+                              setState(() {});
+                            },
+                          )
+                        : null,
                 filled: true,
                 fillColor: Colors.white,
                 border: OutlineInputBorder(
@@ -303,7 +331,7 @@ class _NotesPageState extends State<NotesPage> {
 
             const SizedBox(height: 15),
 
-            // Filtro de categorias
+            // Filtro por categoria
             DropdownButtonFormField<String>(
               initialValue: selectedCategory,
               decoration: InputDecoration(
@@ -336,9 +364,10 @@ class _NotesPageState extends State<NotesPage> {
 
             const SizedBox(height: 12),
 
-            // Ordenação por data
+            // Ordenacao por data
             Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              mainAxisAlignment:
+                  MainAxisAlignment.spaceBetween,
               children: [
                 Text(
                   '${visibleNotes.length} nota(s)',
