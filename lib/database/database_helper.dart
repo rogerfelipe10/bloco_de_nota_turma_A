@@ -334,5 +334,55 @@ class DatabaseHelper {
       );
     });
   }
+  
+  // Remove notas locais que foram excluidas do Firestore.
+  // Preserva todas as alteracoes locais pendentes.
+  Future<int> removeMissingCloudNotes(
+    String uid,
+    Set<String> remoteIds,
+  ) async {
+    final db = await database;
+
+    return await db.transaction((txn) async {
+      final localNotes = await txn.query(
+        'notes',
+        columns: ['id', 'cloudId'],
+        where: '''
+          uid = ?
+          AND cloudId IS NOT NULL
+          AND syncStatus = ?
+          AND isDeleted = 0
+        ''',
+        whereArgs: [uid, 'synced'],
+      );
+
+      int removed = 0;
+
+      for (final row in localNotes) {
+        final cloudId = row['cloudId'] as String;
+
+        if (!remoteIds.contains(cloudId)) {
+          removed += await txn.delete(
+            'notes',
+            where: '''
+              id = ?
+              AND uid = ?
+              AND cloudId = ?
+              AND syncStatus = ?
+              AND isDeleted = 0
+            ''',
+            whereArgs: [
+              row['id'],
+              uid,
+              cloudId,
+              'synced',
+            ],
+          );
+        }
+      }
+
+      return removed;
+    });
+  }
 
 }

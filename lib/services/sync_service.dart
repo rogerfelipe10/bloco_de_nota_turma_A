@@ -1,6 +1,7 @@
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
 
 import '../database/database_helper.dart';
 import '../models/note.dart';
@@ -23,21 +24,29 @@ class SyncService {
     }
   }
 
-  // Sincroniza notas locais e notas da nuvem
+  // Sincroniza notas locais e notas do Firebase
   Future<void> syncNotes(String uid) async {
-    if (_isSyncing) return;
+    if (_isSyncing) {
+      debugPrint('SINCRONIZACAO JA EM ANDAMENTO');
+      return;
+    }
 
     checkUser(uid);
     _isSyncing = true;
 
     try {
-      // ETAPA 1: enviar alteracoes locais
+      debugPrint('INICIANDO SINCRONIZACAO');
+
+      // Envia as alteracoes locais
       await uploadPendingNotes(uid);
 
-      // ETAPA 2: recuperar notas da nuvem
+      // Recupera as notas da nuvem
       await downloadCloudNotes(uid);
 
+      debugPrint('SINCRONIZACAO FINALIZADA');
     } catch (e) {
+      debugPrint('ERRO NA SINCRONIZACAO: $e');
+
       throw Exception(
         'Falha na sincronizacao: $e',
       );
@@ -53,6 +62,10 @@ class SyncService {
     final pendingNotes =
         await database.getPendingNotes(uid);
 
+    debugPrint(
+      'NOTAS PENDENTES: ${pendingNotes.length}',
+    );
+
     for (final row in pendingNotes) {
       checkUser(uid);
 
@@ -62,11 +75,13 @@ class SyncService {
 
       String? cloudId = row['cloudId'] as String?;
 
-      // Sincroniza notas excluidas
+      // Envia exclusoes pendentes
       if (isDeleted) {
         if (cloudId != null) {
           await firestore.deleteNote(cloudId);
         }
+
+        checkUser(uid);
 
         await database.confirmDeletedNote(
           id,
@@ -77,7 +92,7 @@ class SyncService {
         continue;
       }
 
-      // Gera um ID fixo para evitar duplicatas
+      // Cria identificador permanente na nuvem
       if (cloudId == null) {
         cloudId = FirebaseFirestore.instance
             .collection('users')
@@ -95,11 +110,14 @@ class SyncService {
         );
 
         if (assigned == 0) {
+          debugPrint(
+            'NAO FOI POSSIVEL ATRIBUIR CLOUD ID: $id',
+          );
           continue;
         }
       }
 
-      // Converte o registro do SQLite em Note
+      // Converte os dados locais em Note
       final note = Note(
         id: id,
         uid: uid,
@@ -111,13 +129,12 @@ class SyncService {
         updatedAt: updatedAt,
       );
 
-      // Envia a nota para o Firebase
+      // Envia para o Firebase
       await firestore.saveNote(note);
 
       checkUser(uid);
 
-      // Marca a nota como sincronizada
-      // somente se ela nao foi modificada
+      // Confirma a sincronizacao
       await database.markNoteSynced(
         id,
         uid,
@@ -127,13 +144,13 @@ class SyncService {
     }
   }
 
-  // Recupera as notas armazenadas no Firestore
+  // Recupera notas do Firebase para o SQLite
   Future<void> downloadCloudNotes(String uid) async {
     checkUser(uid);
 
-    // Consulta os documentos no servidor.
-    // Se o Firebase estiver inacessivel,
-    // o erro sera tratado pelo syncNotes.
+    debugPrint('BUSCANDO NOTAS NO FIRESTORE');
+
+    // Consulta o servidor, nao apenas o cache local
     final snapshot = await FirebaseFirestore.instance
         .collection('users')
         .doc(uid)
@@ -144,13 +161,27 @@ class SyncService {
           ),
         );
 
+    checkUser(uid);
+
+    // Identificadores existentes na nuvem
+    final remoteIds = snapshot.docs
+        .map((doc) => doc.id)
+        .toSet();
+
+    debugPrint(
+      'DOCUMENTOS EXISTENTES NO FIRESTORE: ${remoteIds.length}',
+    );
+
+    // Recupera notas da nuvem
     for (final doc in snapshot.docs) {
       checkUser(uid);
 
       final data = doc.data();
 
-      // Confere que a nota pertence ao usuario
       if (data['uid'] != uid) {
+        debugPrint(
+          'DOCUMENTO IGNORADO POR UID DIFERENTE: ${doc.id}',
+        );
         continue;
       }
 
@@ -165,9 +196,19 @@ class SyncService {
         updatedAt: data['updatedAt'] as String?,
       );
 
-      // Salva no SQLite sem duplicar registros
-      // e sem sobrescrever alteracoes pendentes
       await database.saveRemoteNote(note);
     }
+
+    checkUser(uid);
+
+    // Remove notas locais que nao existem mais no Firebase
+    final removed = await database.removeMissingCloudNotes(
+      uid,
+      remoteIds,
+    );
+
+    debugPrint(
+      'NOTAS REMOVIDAS DO SQLITE: $removed',
+    );
   }
 }
