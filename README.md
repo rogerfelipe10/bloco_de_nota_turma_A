@@ -155,3 +155,21 @@ Projeto acadêmico desenvolvido utilizando Flutter, Dart, Firebase e SQLite.
 ---
 
 **Bloco de Notas — Suas anotações disponíveis, com ou sem internet.**
+
+
+## Evidências do aplicativo
+
+### Tela principal
+![Tela principal](imagens/notas.png)
+
+### Janela de resolução de conflitos
+![Conflitos](imagens/conflitos.png)
+
+### Funcionamento offline
+![Modo offline](imagens/offline.png)
+
+### Banco de dados Firebase
+![Firebase](imagens/firebase.png)
+
+### Opção Resolver depois
+![Resolver depois](imagens/resolver_depois.png)
