@@ -4,6 +4,7 @@ import 'package:bloco_de_nota_turma_a/models/note.dart';
 import 'package:bloco_de_nota_turma_a/pages/login_page.dart';
 import 'package:bloco_de_nota_turma_a/pages/note_form_page.dart';
 import 'package:bloco_de_nota_turma_a/services/auth_service.dart';
+import 'package:bloco_de_nota_turma_a/services/sync_service.dart';
 import 'package:bloco_de_nota_turma_a/widgets/note_card.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
@@ -18,6 +19,7 @@ class NotesPage extends StatefulWidget {
 class _NotesPageState extends State<NotesPage> {
   final DatabaseHelper database = DatabaseHelper.instance;
   final AuthService authService = AuthService();
+  final SyncService syncService = SyncService();
 
   final TextEditingController searchController =
       TextEditingController();
@@ -27,6 +29,7 @@ class _NotesPageState extends State<NotesPage> {
   String selectedCategory = 'Todas';
   bool newestFirst = true;
   bool isLoading = true;
+  bool isSyncing = false;
 
   final List<String> categories = [
     'Todas',
@@ -36,17 +39,27 @@ class _NotesPageState extends State<NotesPage> {
     'Outros',
   ];
 
-  @override
-  void initState() {
-    super.initState();
-    loadNotes();
-  }
+  
+@override
+void initState() {
+  super.initState();
+
+  // Mostra primeiro as notas salvas localmente.
+  loadNotes();
+
+  // Tenta sincronizar com o Firebase ao abrir a tela.
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    if (mounted) {
+      synchronizeNotes();
+    }
+  });
+}
 
   // Carrega as notas do usuario autenticado
   Future<void> loadNotes() async {
     final user = FirebaseAuth.instance.currentUser;
 
-    // DIAGNOSTICO TEMPORARIO DO SQLITE
+    // Diagnostico temporario do SQLite
     try {
       final allNotes = await database.debugAllNotes();
 
@@ -57,23 +70,14 @@ class _NotesPageState extends State<NotesPage> {
       for (final note in allNotes) {
         debugPrint(
           'ID: ${note['id']} | '
-          'UID: ${note['uid']} | '
           'Titulo: ${note['title']} | '
-          'Excluida: ${note['isDeleted']}',
-        );
-      }
-
-      if (user != null) {
-        debugPrint(
-          'UID DO USUARIO ATUAL: ${user.uid}',
+          'Excluida: ${note['isDeleted']} | '
+          'Status: ${note['syncStatus']}',
         );
       }
     } catch (e) {
-      debugPrint(
-        'ERRO AO CONSULTAR SQLITE: $e',
-      );
+      debugPrint('Erro no diagnostico SQLite: $e');
     }
-    // FIM DO DIAGNOSTICO
 
     if (user == null) {
       if (mounted) {
@@ -109,7 +113,7 @@ class _NotesPageState extends State<NotesPage> {
     }
   }
 
-  // Converte datas antigas e novas
+  // Converte as datas para ordenacao
   DateTime parseNoteDate(Note note) {
     final value = note.updatedAt;
 
@@ -136,7 +140,7 @@ class _NotesPageState extends State<NotesPage> {
     }
   }
 
-  // Pesquisa, filtra e ordena as notas
+  // Pesquisa, filtra e ordena
   List<Note> get filteredNotes {
     final search =
         searchController.text.trim().toLowerCase();
@@ -154,10 +158,9 @@ class _NotesPageState extends State<NotesPage> {
     }).toList();
 
     result.sort((a, b) {
-      final dateA = parseNoteDate(a);
-      final dateB = parseNoteDate(b);
-
-      final comparison = dateA.compareTo(dateB);
+      final comparison = parseNoteDate(a).compareTo(
+        parseNoteDate(b),
+      );
 
       if (comparison == 0) {
         final idComparison =
@@ -176,7 +179,54 @@ class _NotesPageState extends State<NotesPage> {
     return result;
   }
 
-  // Exclui uma nota localmente
+  // Envia as notas pendentes ao Firebase
+  Future<void> synchronizeNotes() async {
+    if (isSyncing) return;
+
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) return;
+
+    setState(() {
+      isSyncing = true;
+    });
+
+    try {
+      await syncService.syncNotes(user.uid);
+
+      if (!mounted) return;
+
+      await loadNotes();
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Sincronização com Firebase concluída!',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Não foi possível sincronizar: $e',
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          isSyncing = false;
+        });
+      }
+    }
+  }
+
+  // Exclui uma nota local
   Future<void> deleteNote(int id) async {
     try {
       await database.deleteNote(id);
@@ -186,7 +236,7 @@ class _NotesPageState extends State<NotesPage> {
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Nota excluida com sucesso!'),
+          content: Text('Nota excluída com sucesso!'),
         ),
       );
     } catch (e) {
@@ -200,7 +250,7 @@ class _NotesPageState extends State<NotesPage> {
     }
   }
 
-  // Sair da conta
+  // Faz logout
   Future<void> logout() async {
     await authService.logout();
 
@@ -227,7 +277,7 @@ class _NotesPageState extends State<NotesPage> {
     await loadNotes();
   }
 
-  // Abre o formulario de nova nota
+  // Abre formulario de nova nota
   Future<void> openNewNote() async {
     await Navigator.push(
       context,
@@ -259,11 +309,29 @@ class _NotesPageState extends State<NotesPage> {
           ),
         ),
         actions: [
+          // Botao de sincronizacao
+          IconButton(
+            tooltip: 'Sincronizar notas',
+            onPressed: isSyncing
+                ? null
+                : synchronizeNotes,
+            icon: isSyncing
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                    ),
+                  )
+                : const Icon(Icons.sync_rounded),
+          ),
+
           IconButton(
             tooltip: 'Sair',
             onPressed: logout,
             icon: const Icon(Icons.logout_rounded),
           ),
+
           const SizedBox(width: 8),
         ],
       ),
@@ -298,7 +366,7 @@ class _NotesPageState extends State<NotesPage> {
 
             const SizedBox(height: 20),
 
-            // Pesquisa
+            // Campo de pesquisa
             TextField(
               controller: searchController,
               onChanged: (value) {
@@ -331,7 +399,7 @@ class _NotesPageState extends State<NotesPage> {
 
             const SizedBox(height: 15),
 
-            // Filtro por categoria
+            // Filtro de categoria
             DropdownButtonFormField<String>(
               initialValue: selectedCategory,
               decoration: InputDecoration(

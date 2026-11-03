@@ -238,5 +238,101 @@ class DatabaseHelper {
     final db = await database;
     return await db.query('notes');
   }
+  
+  // Guarda o ID da nuvem antes de enviar a nota
+  Future<int> assignCloudId(
+    int id,
+    String uid,
+    String cloudId,
+    String expectedUpdatedAt,
+  ) async {
+    final db = await database;
+
+    return await db.update(
+      'notes',
+      {'cloudId': cloudId},
+      where: '''
+        id = ?
+        AND uid = ?
+        AND updatedAt = ?
+        AND cloudId IS NULL
+        AND syncStatus = 'pending'
+        AND isDeleted = 0
+      ''',
+      whereArgs: [id, uid, expectedUpdatedAt],
+    );
+  }
+
+  // Consulta uma nota local pelo ID do Firestore
+  Future<Map<String, dynamic>?> getNoteByCloudId(
+    String uid,
+    String cloudId,
+  ) async {
+    final db = await database;
+
+    final result = await db.query(
+      'notes',
+      where: 'uid = ? AND cloudId = ?',
+      whereArgs: [uid, cloudId],
+      limit: 1,
+    );
+
+    if (result.isEmpty) return null;
+
+    return result.first;
+  }
+
+  // Recebe uma nota do Firestore no banco local
+  Future<void> saveRemoteNote(Note note) async {
+    final db = await database;
+
+    if (note.cloudId == null) {
+      throw ArgumentError(
+        'Nota recebida sem identificador da nuvem',
+      );
+    }
+
+    await db.transaction((txn) async {
+      final existing = await txn.query(
+        'notes',
+        where: 'uid = ? AND cloudId = ?',
+        whereArgs: [note.uid, note.cloudId],
+        limit: 1,
+      );
+
+      if (existing.isEmpty) {
+        await txn.insert(
+          'notes',
+          {
+            ...note.toMap(),
+            'syncStatus': 'synced',
+            'isDeleted': 0,
+          },
+        );
+        return;
+      }
+
+      final local = existing.first;
+
+      // Nunca sobrescreve uma alteração local pendente
+      if (local['syncStatus'] == 'pending') {
+        return;
+      }
+
+      await txn.update(
+        'notes',
+        {
+          'title': note.title,
+          'content': note.content,
+          'date': note.date,
+          'category': note.category,
+          'updatedAt': note.updatedAt,
+          'syncStatus': 'synced',
+        },
+        where: 'id = ? AND uid = ? AND isDeleted = 0',
+        whereArgs: [local['id'], note.uid],
+      );
+    });
+  }
 
 }
